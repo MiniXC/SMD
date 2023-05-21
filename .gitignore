@@ -1,0 +1,7 @@
+# python/pytorch lightning gitignore template
+__pycache__/
+lightning_logs/
+wandb/
+checkpoints/
+train.sh
+*.png
