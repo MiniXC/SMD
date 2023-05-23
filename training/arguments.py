@@ -20,23 +20,39 @@ class Args:
     # model
     num_layers: int = 8
     depthwise: bool = False
-    filter_size: int = 256
-    kernel_size: int = 3
-    dropout: float = 0.1
+    filter_size: int = 512
+    kernel_size: int = 9
+    dropout: float = 0.25
     step_embed_dim_hidden: int = 512
+    # scheduler network
+    scheduler_num_layers: int = 2
+    scheduler_filter_size: int = 256
+    scheduler_kernel_size: int = 3
+    scheduler_dropout: float = 0.1
+    scheduler_depthwise: bool = False
+    use_scheduler: bool = True
+    scheduler_every: int = 10
+    scheduler_tau: int = 50
+    scheduler_loss_threshold: float = 0.25
     # diffusion
     num_steps: int = 1000
     num_steps_eval: int = 8
     beta_0: float = 0.000001
     beta_T: float = 0.01
+    use_sigmoid_schedule: bool = False
+    sigmoid_start: int = 0
+    sigmoid_end: int = 3
+    sigmoid_tau: float = 0.5
+    signal_scale: float = 1.0
     # training
-    max_epochs: int = 20
-    learning_rate: float = 1e-4
-    warmup_steps: int = 5000
+    max_epochs: int = 1
+    lr_max_epochs: int = None
+    learning_rate: float = 2e-4
+    warmup_steps: int = 1
     weight_decay: float = 0.01
     log_every: int = 500
     eval_every: int = 5000
-    save_every: int = 5000
+    save_every: int = 20000
     checkpoint_dir: str = "checkpoints"
     batch_size: int = 8
     eval_batch_size: int = 2
@@ -46,6 +62,8 @@ class Args:
     strict_load: bool = False
     max_grad_norm: float = 1.0
     train_loss_logging_sum_steps: int = 100
+    gradient_accumulation_steps: int = 32
+    eval_only: bool = False
     # wandb
     wandb_project: str = "smooth_mel_diffusion"
     wandb_run_name: str = None

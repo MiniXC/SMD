@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import numpy as np
 from tqdm.auto import tqdm
+import copy
 
 class DiffusionSampler():
 
@@ -50,7 +51,7 @@ class DiffusionSampler():
         self.model = model
         self.diff_params = diffusion_params
 
-    def __call__(self, c, N=4, bs=1, no_grad=True, single_element=False):
+    def __call__(self, batch, N=4, return_sequence=False, verbose=True):
         if N not in self.noise_schedules:
             raise ValueError(f"Invalid noise schedule length {N}")
 
@@ -59,27 +60,30 @@ class DiffusionSampler():
         if not isinstance(noise_schedule, torch.Tensor):
             noise_schedule = torch.FloatTensor(noise_schedule)
 
-        noise_schedule = noise_schedule.to(c.device)
+        noise_schedule = noise_schedule.to(batch["cond_mel"].device)
         noise_schedule = noise_schedule.to(torch.float32)
 
         pred = self.sampling_given_noise_schedule(
-            noise_schedule,
-            c,
-            no_grad=no_grad,
-            single_element=single_element,
+            size=batch["cond_mel"].shape,
+            inference_noise_schedule=noise_schedule,
+            condition=batch["cond_mel"],
+            return_sequence=return_sequence,
+            verbose=verbose,
         )
 
         return pred
 
     def sampling_given_noise_schedule(
-        self,
-        noise_schedule,
-        c,
-        no_grad=True,
-        single_element=False,
-    ):
+            self,
+            size,
+            inference_noise_schedule,
+            condition,
+            return_sequence=False,
+            verbose=False,
+        ):
         """
         Perform the complete sampling step according to p(x_0|x_T) = \prod_{t=1}^T p_{\theta}(x_{t-1}|x_t)
+
         Parameters:
         net (torch network):            the wavenet models
         size (tuple):                   size of tensor to be generated,
@@ -88,69 +92,71 @@ class DiffusionSampler():
                                         note, the tensors need to be cuda tensors
         condition (torch.tensor):       ground truth mel spectrogram read from disk
                                         None if used for unconditional generation
+
         Returns:
         the generated audio(s) in torch.tensor, shape=size
         """
 
-        batch_size = c.shape[0]
-        if single_element:
-            sequence_length = 1
-        else:
-            sequence_length = c.shape[1]
+        ddim = False
 
         _dh = self.diff_params
         T, alpha = _dh["T"], _dh["alpha"]
         assert len(alpha) == T
+        assert len(size) == 3
 
-        N = len(noise_schedule)
-        beta_infer = noise_schedule
-        alpha_infer = [1 - float(x) for x in beta_infer] 
+        N = len(inference_noise_schedule)
+        beta_infer = inference_noise_schedule
+        alpha_infer = 1 - beta_infer
         sigma_infer = beta_infer + 0
-
         for n in range(1, N):
             alpha_infer[n] *= alpha_infer[n - 1]
             sigma_infer[n] *= (1 - alpha_infer[n - 1]) / (1 - alpha_infer[n])
-        alpha_infer = torch.FloatTensor([np.sqrt(x) for x in alpha_infer])
+        alpha_infer = torch.sqrt(alpha_infer)
         sigma_infer = torch.sqrt(sigma_infer)
 
         # Mapping noise scales to time steps
         steps_infer = []
         for n in range(N):
-            step = self.map_noise_scale_to_time_step(alpha_infer[n], alpha)
+            step = DiffusionSampler.map_noise_scale_to_time_step(alpha_infer[n], alpha)
             if step >= 0:
                 steps_infer.append(step)
+        print(steps_infer, flush=True)
         steps_infer = torch.FloatTensor(steps_infer)
 
+        # N may change since alpha_infer can be out of the range of alpha
         N = len(steps_infer)
 
-        x = torch.normal(0, 1, size=(batch_size, sequence_length, 80)).to(device=c.device, dtype=c.dtype)
-        if sequence_length == 1:
-            x = x.squeeze(1)
+        print('begin sampling, total number of reverse steps = %s' % N)
 
-        def sampling_loop(x, length, progress_bar=True):
-            if progress_bar:
-                N = tqdm(range(length - 1, -1, -1), desc="Diffusion sampling")
-            else:
-                N = range(length - 1, -1, -1)
-            for n in N:
-                step = (steps_infer[n] * torch.ones((batch_size, 1, 1))).to(device=c.device, dtype=c.dtype)
-                e = self.model.forward(c, x, step)
-                if sequence_length == 1:
-                    e = (e.squeeze(1), None)
-                x = x - (beta_infer[n] / torch.sqrt(1 - alpha_infer[n] ** 2.) * e)
-                x = x / torch.sqrt(1 - beta_infer[n])
-                if n > 0:
-                    x = x + sigma_infer[n] * torch.normal(0, 1, size=x.shape).to(device=c.device, dtype=c.dtype)
-
-        if no_grad:
-            with torch.no_grad():
-                sampling_loop(x, N)
-        else:
-            sampling_loop(x, N, progress_bar=False)
-
+        x = torch.normal(0, 1, size=size).to(device=condition.device, dtype=condition.dtype)
+        if return_sequence:
+            x_ = copy.deepcopy(x)
+            xs = [x_]
+        with torch.no_grad():
+            for n in range(N - 1, -1, -1):
+                diffusion_steps = (steps_infer[n] * torch.ones((size[0], 1))).to(device=condition.device, dtype=condition.dtype)
+                diffusion_steps = diffusion_steps.unsqueeze(1)
+                epsilon_theta = self.model(cond_mel=condition, noisy_mel=x, step=diffusion_steps)
+                if ddim:
+                    alpha_next = alpha_infer[n] / (1 - beta_infer[n]).sqrt()
+                    c1 = alpha_next / alpha_infer[n]
+                    c2 = -(1 - alpha_infer[n] ** 2.).sqrt() * c1
+                    c3 = (1 - alpha_next ** 2.).sqrt()
+                    x = c1 * x + c2 * epsilon_theta + c3 * epsilon_theta  # std_normal(size)
+                else:
+                    x -= beta_infer[n] / torch.sqrt(1 - alpha_infer[n] ** 2.) * epsilon_theta
+                    x /= torch.sqrt(1 - beta_infer[n])
+                    if n > 0:
+                        x = x + sigma_infer[n] * torch.normal(0, 1, size=size).to(device=condition.device, dtype=condition.dtype)
+                if return_sequence:
+                    x_ = copy.deepcopy(x)
+                    xs.append(x_)
+        if return_sequence:
+            return xs
         return x
 
-    def map_noise_scale_to_time_step(self, alpha_infer, alpha):
+    @staticmethod
+    def map_noise_scale_to_time_step(alpha_infer, alpha):
         if alpha_infer < alpha[-1]:
             return len(alpha) - 1
         if alpha_infer > alpha[0]:
@@ -172,8 +178,23 @@ def compute_diffusion_params(T, beta_0, beta_T):
     for t in range(1, len(beta)):
         alpha[t] *= alpha[t-1]
     alpha = torch.sqrt(alpha)
-    diff_params = {"T": len(beta), "alpha": alpha}
+    diff_params = {
+        "T": len(beta),
+        "alpha": alpha,
+    }
     return diff_params
+
+def compute_diffusion_params_sigmoid(T, start, end, tau=1.0, clip_min=1e-9):
+# A gamma function based on sigmoid function.
+  alpha = torch.linspace(0, 1, T)
+  v_start = torch.sigmoid(torch.tensor(start / tau))
+  v_end = torch.sigmoid(torch.tensor(end / tau))
+  output = torch.sigmoid((alpha * (end - start) + start) / tau)
+  output = (v_end - output) / (v_end - v_start)
+  return {
+    "T": len(alpha),
+    "alpha": torch.clip(output, clip_min, 1.),
+  }
 
 class StepEmbedding(nn.Module):
     def __init__(self, dim_in, dim_hidden, dim_out):
